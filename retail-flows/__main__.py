@@ -15,8 +15,15 @@ import os
 import sqlite3
 import urllib3
 
+# t0, the time that RTAT data is available from
 t0: Final[datetime] = datetime(2016, 1, 15)
+
+# t1, the time that RTAT data is available up to (now)
 t1: Final[datetime] = datetime.now()
+
+# n_days, the number of days between t0 and t1. This is used to determine how
+# many rows to fetch via the API.
+n_days: Final[int] = (t1 - t0).days
 
 NASDAQ_TYPE_MAP: Final[Dict[str, type]] = {
     'Date': datetime,
@@ -70,7 +77,7 @@ class RowDict(TypedDict, total=True):
 class Row():
     def __init__(self: Self, cols: List[Any]):
 
-        self._date = cols[0]
+        self._date = datetime.strptime(cols[0], '%Y-%m-%d')
         self._name = cols[1]
         self._activity = float(cols[2])
         self._sentiment = int(cols[3])
@@ -120,11 +127,34 @@ class Client():
             ),  # use the customized Retry instance
         )
 
+        self._con = sqlite3.connect("retail-flows.db")
+        self._cur = self.con.cursor()
+
+        self._cur.execute("""
+            CREATE TABLE IF NOT EXISTS rtat (
+                date TEXT NOT NULL,
+                ticker TEXT NOT NULL,
+                activity REAL NOT NULL,
+                sentiment INTEGER NOT NULL,
+                PRIMARY KEY (date, ticker)
+            )
+        """)
+
+        self.con.commit()
+
         pass
 
     @property
     def api_key(self: Self) -> str:
         return self._api_key
+
+    @property
+    def con(self: Self) -> sqlite3.Connection:
+        return self._con
+
+    @property
+    def cur(self: Self) -> sqlite3.Cursor:
+        return self._cur
 
     @property
     def manager(self: Self) -> urllib3.PoolManager:
@@ -134,14 +164,30 @@ class Client():
     def retries(self: Self) -> int:
         return self._retries
 
-    def ticker_coverage(self: Self) -> List[str]:
+    def ticker_coverage(self: Self) -> Iterator[List[str]]:
         resp: HTTPResponse = self.manager.request('GET', 'https://static.quandl.com/coverage/NDAQ_RTAT.csv')
         return list(resp.data.decode('utf-8').splitlines())[1:]
 
-    def last_update(self: Self, cur: sqlite3.Cursor, ticker: str) -> datetime:
-        cur.execute('SELECT MAX(date) FROM rtat WHERE ticker = ?', (ticker,))
+    def needs_update(self: Self, timestamps: datetime | Iterator[datetime]) -> Iterator[str]:
+        if isinstance(timestamps, datetime):
+            timestamps = [timestamps]
+        elif isinstance(timestamps, tuple):
+            timestamps = list(timestamps)
+        elif not isinstance(timestamps, list):
+            raise ValueError(f"dates must be a datetime or list of datetimes, got {repr(timestamps)}")
 
-        result = cur.fetchone()[0]
+        for timestamp in timestamps:
+            self.cur.execute('SELECT ticker, COUNT(ticker) FROM rtat WHERE date > ?', (timestamp,))
+
+            ticker, n = self.cur.fetchone()
+
+            if n > 0:
+                yield ticker
+
+    def last_update(self: Self, ticker: str) -> datetime:
+        self.cur.execute('SELECT MAX(date) FROM rtat WHERE ticker = ?', (ticker,))
+
+        result = self.cur.fetchone()[0]
 
         if result is None:
             return t0
@@ -152,7 +198,7 @@ class Client():
             self: Self,
             tickers: Iterator[str],
             timestamps: Iterator[datetime]
-        ) -> urllib3.HTTPResponse:
+        ) -> Iterator[Row]:
 
         dates = [t.strftime('%Y-%m-%d') for t in list(timestamps)]
 
@@ -161,14 +207,35 @@ class Client():
         else:
             params = urlencode({
                 'date': str.join(',', dates),
-                'ticker': str.join(',', tickers),
+                'ticker': str.join(',', list(tickers)),
                 'api_key': self.api_key,
             })
 
             resp = self.manager.request('GET', f'{Client.BASE_URL}/NDAQ/RTAT?{params}').data.decode('utf-8')
-            table = json.loads(resp)['datatable']
+            body = json.loads(resp)
 
-            return list(map(Row, table['data']))
+            if isinstance(body, dict):
+                body = body.get('datatable')
+            else:
+                raise ValueError(f"missing 'datatable' in response: {body}")
+
+            if isinstance(body, dict):
+                body = body.get('data')
+            else:
+                raise ValueError(f"missing 'data' in response datatable: {body}")
+
+            rows = map(Row, body)
+
+            for row in rows:
+                self.cur.execute(
+                    """
+                    INSERT OR REPLACE INTO rtat (date, ticker, activity, sentiment)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row.date, row.name, row.activity, row.sentiment)
+                )
+
+            self.con.commit()
 
 def daily(t0: datetime, t1: datetime) -> Iterator[datetime]:
     t = t0
@@ -184,96 +251,30 @@ def daily(t0: datetime, t1: datetime) -> Iterator[datetime]:
         t += timedelta(days=1)
 
 def main():
-    parser = argparse.ArgumentParser(description='Fetch retail trading activity and sentiment data from Nasdaq.')
-    parser.add_argument('--api-key', type=str, required=True, help='Your Nasdaq API key.')
+    parser = argparse.ArgumentParser(
+        description='Fetch retail trading activity and sentiment (RTAT) data from NASDAQ.'
+    )
+
+    parser.add_argument('--api-key',
+        type=str,
+        required=True,
+        help='Your Nasdaq API key.'
+    )
+
+    parser.add_argument('--batch-size',
+        type=int,
+        default=100,
+        help='The number of tickers and dates to fetch per request. Default is 10.')
+
+
     args = parser.parse_args()
-
-    con = sqlite3.connect("retail-flows.db")
-    cur = con.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS rtat (
-            date TEXT NOT NULL,
-            ticker TEXT NOT NULL,
-            activity REAL NOT NULL,
-            sentiment INTEGER NOT NULL,
-            PRIMARY KEY (date, ticker)
-        )
-    """)
-
-    con.commit()
 
     client: Final[Client] = Client(api_key=args.api_key)
 
-    i: int = 0
-
-    for tickers in batched(client.ticker_coverage(), 10):
-        for timestamps in batched(daily(t0, t1), 10):
+    for timestamps in batched(daily(t0, t1), args.batch_size):
+        for tickers in batched(client.ticker_coverage(), args.batch_size):
             resp = client.retail_track(tickers=tickers, timestamps=timestamps)
-
-            for row in resp:
-                cur.execute(
-                    """
-                    INSERT OR REPLACE INTO rtat (date, ticker, activity, sentiment)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (row.date, row.name, row.activity, row.sentiment)
-                )
-
-            print(i * 100)
-            i+=1
-    # for ticker in client.ticker_coverage():
-    #     t = client.last_update(cur, ticker)
-
-    #     print(f'Fetching {ticker} from {t} to {t1}')
-
-    #     while t <= t1:
-
-    #         for row in resp:
-    #             cur.execute(
-    #                 """
-    #                 INSERT OR REPLACE INTO rtat (date, ticker, activity, sentiment)
-    #                 VALUES (?, ?, ?, ?)
-    #                 """,
-    #                 (row.date, row.name, row.activity, row.sentiment)
-    #             )
-
-    #         con.commit()
-    #         t += timedelta(days=1)
-    #         print(t)
-
-
-    # for ticker in client.ticker_coverage():
-    #     cur.execute(
-    #         """
-    #         """,
-    #         (ticker, t0)
-    #     )
-
-
-
-
-    # t = args.t0
-
-    # while t <= args.t1:
-    #     resp = client.retail_track(
-    #         ticker=args.ticker,
-    #         timestamps=[t]
-    #     )
-
-    #     print(resp)
-    #     t += timedelta(days=1)
-
-    # resp = client.retail_track(
-    #     ticker='MSTR',
-    #     timestamps=[
-    #         datetime(2023, 6, 5),
-    #         datetime(2023, 6, 6),
-    #     ]
-    # )
-
-    # print(resp)
-
+            print(tickers, timestamps)
 
 if __name__ == '__main__':
     main()
